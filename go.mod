@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/caarlos0/env/v11 v11.3.1
 	github.com/google/go-github/v82 v82.0.0
-	gitlab.com/gitlab-org/api/client-go v1.34.0
+	gitlab.com/gitlab-org/api/client-go v1.45.0
 	go.uber.org/fx v1.24.0
 	go.uber.org/zap v1.27.1
 )
