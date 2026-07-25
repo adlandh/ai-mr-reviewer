@@ -20,7 +20,7 @@ type Reviewer struct {
 }
 
 type reviewResponse struct {
-	Issues []reviewIssuePayload `json:"issues"`
+	Issues []json.RawMessage `json:"issues"`
 }
 
 type reviewIssuePayload struct {
@@ -146,9 +146,13 @@ func (r *Reviewer) reviewBatch(ctx context.Context, batch reviewBatch) error {
 		return fmt.Errorf("review code: %w", err)
 	}
 
-	issues, err := parseReviewResponse(reviewText)
+	issues, malformedIssues, err := parseReviewResponse(reviewText)
 	if err != nil {
 		return fmt.Errorf("parse review response: %w", err)
+	}
+
+	for _, err := range malformedIssues {
+		r.logger.Warn("skip invalid issue", zap.String("reason", "malformed JSON"), zap.Error(err))
 	}
 
 	knownFiles := make(map[string]struct{}, len(batch.diffs))
@@ -176,7 +180,9 @@ func (r *Reviewer) reviewBatch(ctx context.Context, batch reviewBatch) error {
 
 func validateReviewIssue(issue domain.ReviewIssue, knownFiles map[string]struct{}) (domain.ReviewIssue, string) {
 	if issue.FilePath == "" && len(knownFiles) == 1 {
-		for issue.FilePath = range knownFiles {
+		for filePath := range knownFiles {
+			issue.FilePath = filePath
+			break
 		}
 	}
 
@@ -203,21 +209,31 @@ func validateReviewIssue(issue domain.ReviewIssue, knownFiles map[string]struct{
 	return issue, ""
 }
 
-func parseReviewResponse(response string) ([]domain.ReviewIssue, error) {
+func parseReviewResponse(response string) ([]domain.ReviewIssue, []error, error) {
 	trimmed := strings.TrimSpace(response)
 
 	jsonStr := extractJSON(trimmed)
 	if jsonStr == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var parsed reviewResponse
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
+		return nil, nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 
-	issues := make([]domain.ReviewIssue, 0, len(parsed.Issues))
-	for _, issue := range parsed.Issues {
+	var (
+		issues          = make([]domain.ReviewIssue, 0, len(parsed.Issues))
+		malformedIssues []error
+	)
+
+	for i, rawIssue := range parsed.Issues {
+		var issue reviewIssuePayload
+		if err := json.Unmarshal(rawIssue, &issue); err != nil {
+			malformedIssues = append(malformedIssues, fmt.Errorf("issue %d: %w", i+1, err))
+			continue
+		}
+
 		filePath := issue.FilePath
 		if filePath == "" {
 			filePath = issue.Path
@@ -231,7 +247,7 @@ func parseReviewResponse(response string) ([]domain.ReviewIssue, error) {
 		})
 	}
 
-	return issues, nil
+	return issues, malformedIssues, nil
 }
 
 func buildReviewBatches(diffs []domain.Diff, maxBytes int) []reviewBatch {

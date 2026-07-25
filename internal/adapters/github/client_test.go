@@ -107,6 +107,21 @@ func TestClientGetMergeRequestChanges(t *testing.T) {
 	}
 }
 
+func TestClientGetMergeRequestChangesReturnsError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("list files failed")
+	apiClient := newTestGitHubAPIClient(t, httpstub.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}))
+	client := &Client{client: apiClient, owner: "acme", repo: "repo", prNumber: 7}
+
+	_, err := client.GetMergeRequestChanges(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected %v, got %v", wantErr, err)
+	}
+}
+
 func TestClientAddMergeRequestDiscussionFallsBackToIssueComment(t *testing.T) {
 	t.Parallel()
 
@@ -191,34 +206,26 @@ func TestClientGetExistingCommentsReturnsReviewCommentsWithPathAndLine(t *testin
 	}
 }
 
+func TestClientGetExistingCommentsReturnsError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("list review comments failed")
+	apiClient := newTestGitHubAPIClient(t, httpstub.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, wantErr
+	}))
+	client := &Client{client: apiClient, owner: "acme", repo: "repo", prNumber: 7}
+
+	_, err := client.GetExistingComments(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected %v, got %v", wantErr, err)
+	}
+}
+
 func TestClientDeleteBotCommentsExceptResolvedDeletesBotReviewAndIssueComments(t *testing.T) {
 	t.Parallel()
 
 	var deletedPaths []string
-	apiClient := newTestGitHubAPIClient(t, httpstub.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == testGitHubPRPath+"/comments" && r.URL.Query().Get("page") == "":
-			return githubJSONPage(`[
-				{"id":12,"body":"human review comment"},
-				{"body":"missing id"}
-			]`, testGitHubBaseURL+"repos/acme/repo/pulls/7/comments?page=2"), nil
-		case r.Method == http.MethodGet && r.URL.Path == testGitHubPRPath+"/comments" && r.URL.Query().Get("page") == "2":
-			return githubJSONPage(`[{"id":11,"body":"ai-mr-reviewer: review comment"}]`, ""), nil
-		case r.Method == http.MethodGet && r.URL.Path == testGitHubIssuePath+"/comments" && r.URL.Query().Get("page") == "":
-			return githubJSONPage(`[
-				{"id":22,"body":"human issue comment"},
-				{"id":23}
-			]`, testGitHubBaseURL+"repos/acme/repo/issues/7/comments?page=2"), nil
-		case r.Method == http.MethodGet && r.URL.Path == testGitHubIssuePath+"/comments" && r.URL.Query().Get("page") == "2":
-			return githubJSONPage(`[{"id":21,"body":"ai-mr-reviewer: issue comment"}]`, ""), nil
-		case r.Method == http.MethodDelete:
-			deletedPaths = append(deletedPaths, r.URL.Path)
-			return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
-		default:
-			t.Fatalf(errUnexpectedRequest, r.Method, r.URL.Path)
-			return nil, nil
-		}
-	}))
+	apiClient := newTestGitHubAPIClient(t, deleteCommentsTransport(t, &deletedPaths))
 
 	client := &Client{
 		client:        apiClient,
@@ -240,6 +247,53 @@ func TestClientDeleteBotCommentsExceptResolvedDeletesBotReviewAndIssueComments(t
 	}
 }
 
+func deleteCommentsTransport(t *testing.T, deletedPaths *[]string) httpstub.RoundTripFunc {
+	t.Helper()
+
+	pages := map[string]struct {
+		body    string
+		nextURL string
+	}{
+		testGitHubPRPath + "/comments#": {
+			body: `[
+				{"id":12,"body":"human review comment"},
+				{"body":"missing id"}
+			]`,
+			nextURL: testGitHubBaseURL + "repos/acme/repo/pulls/7/comments?page=2",
+		},
+		testGitHubPRPath + "/comments#2": {
+			body: `[{"id":11,"body":"ai-mr-reviewer: review comment"}]`,
+		},
+		testGitHubIssuePath + "/comments#": {
+			body: `[
+				{"id":22,"body":"human issue comment"},
+				{"id":23}
+			]`,
+			nextURL: testGitHubBaseURL + "repos/acme/repo/issues/7/comments?page=2",
+		},
+		testGitHubIssuePath + "/comments#2": {
+			body: `[{"id":21,"body":"ai-mr-reviewer: issue comment"}]`,
+		},
+	}
+
+	return func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			*deletedPaths = append(*deletedPaths, r.URL.Path)
+			return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
+		}
+		if r.Method != http.MethodGet {
+			t.Fatalf(errUnexpectedRequest, r.Method, r.URL.Path)
+		}
+
+		page, ok := pages[r.URL.Path+"#"+r.URL.Query().Get("page")]
+		if !ok {
+			t.Fatalf(errUnexpectedRequest, r.Method, r.URL.Path)
+		}
+
+		return githubJSONPage(page.body, page.nextURL), nil
+	}
+}
+
 func TestClientDeleteBotCommentsExceptResolvedReturnsLaterPageError(t *testing.T) {
 	t.Parallel()
 
@@ -257,6 +311,25 @@ func TestClientDeleteBotCommentsExceptResolvedReturnsLaterPageError(t *testing.T
 
 	if err := client.DeleteBotCommentsExceptResolved(context.Background()); err == nil {
 		t.Fatal("expected later page error")
+	}
+}
+
+func TestClientDeleteBotCommentsExceptResolvedReturnsIssueCommentListError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("list issue comments failed")
+	apiClient := newTestGitHubAPIClient(t, httpstub.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == testGitHubPRPath+"/comments" {
+			return githubJSONPage(`[]`, ""), nil
+		}
+
+		return nil, wantErr
+	}))
+	client := &Client{client: apiClient, commentPrefix: "ai-mr-reviewer", owner: "acme", repo: "repo", prNumber: 7}
+
+	err := client.DeleteBotCommentsExceptResolved(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected %v, got %v", wantErr, err)
 	}
 }
 

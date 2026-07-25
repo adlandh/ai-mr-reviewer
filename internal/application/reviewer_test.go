@@ -32,7 +32,7 @@ const (
 )
 
 func TestParseReviewResponse(t *testing.T) {
-	issues, err := parseReviewResponse("some text {\"issues\":[{\"file\":\"a.go\",\"line\":3,\"severity\":\"warning\",\"message\":\"x\"}]} tail")
+	issues, _, err := parseReviewResponse("some text {\"issues\":[{\"file\":\"a.go\",\"line\":3,\"severity\":\"warning\",\"message\":\"x\"}]} tail")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestParseReviewResponse(t *testing.T) {
 }
 
 func TestParseReviewResponseUsesPathFallback(t *testing.T) {
-	issues, err := parseReviewResponse(`{"issues":[{"path":"a.go","line":4,"severity":"warning","message":"x"}]}`)
+	issues, _, err := parseReviewResponse(`{"issues":[{"path":"a.go","line":4,"severity":"warning","message":"x"}]}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestParseReviewResponseUsesPathFallback(t *testing.T) {
 }
 
 func TestParseReviewResponseExtractsJSONFromCodeFence(t *testing.T) {
-	issues, err := parseReviewResponse("```json\n{\"issues\":[{\"file\":\"a.go\",\"line\":3,\"severity\":\"warning\",\"message\":\"x\"}]}\n```")
+	issues, _, err := parseReviewResponse("```json\n{\"issues\":[{\"file\":\"a.go\",\"line\":3,\"severity\":\"warning\",\"message\":\"x\"}]}\n```")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -202,6 +202,7 @@ func TestRunValidatesIssuesIndependently(t *testing.T) {
 	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{{NewPath: "new.go", Content: "diff"}}, nil)
 	h.ai.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues":[
 		{"line":10,"severity":" WARNING ","message":" fix it "},
+		{"file":"new.go","line":"ten","severity":"warning","message":"bad type"},
 		{"file":"new.go","line":0,"severity":"warning","message":"bad line"},
 		{"file":"new.go","line":11,"severity":"critical","message":"bad severity"},
 		{"file":"new.go","line":12,"severity":"info","message":"   "},
@@ -219,13 +220,20 @@ func TestRunValidatesIssuesIndependently(t *testing.T) {
 	if len(added) != 1 {
 		t.Fatalf(expectedOneDiscussionFmt, len(added))
 	}
-	if logs.Len() != 4 {
-		t.Fatalf("expected 4 warnings, got %d", logs.Len())
+	if logs.Len() != 5 {
+		t.Fatalf("expected 5 warnings, got %d", logs.Len())
 	}
+	malformedWarning := false
 	for _, entry := range logs.All() {
 		if entry.Message != "skip invalid issue" {
 			t.Fatalf("unexpected warning: %s", entry.Message)
 		}
+		if entry.ContextMap()["reason"] == "malformed JSON" {
+			malformedWarning = true
+		}
+	}
+	if !malformedWarning {
+		t.Fatal("expected malformed JSON warning")
 	}
 }
 
@@ -332,6 +340,34 @@ func TestRunStopsWhenBatchReviewFails(t *testing.T) {
 	err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "review batch 2/3") {
 		t.Fatalf("expected second batch error, got %v", err)
+	}
+}
+
+func TestRunReturnsInvalidReviewResponseError(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	h.mr.EXPECT().GetExistingComments(mock.Anything).Return(map[string][]string{}, nil)
+	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{{NewPath: "new.go", Content: "diff"}}, nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues": invalid}`, nil)
+
+	err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "parse review response") {
+		t.Fatalf("expected parse review response error, got %v", err)
+	}
+}
+
+func TestRunWarnsWhenAddingDiscussionFails(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	core, logs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+
+	expectSingleDiffReview(h, nil, nil, `{"file":"new.go","line":10,"severity":"warning","message":"fix it"}`)
+	h.mr.EXPECT().AddMergeRequestDiscussion(mock.Anything, "new.go", 10, warningComment).Return(context.DeadlineExceeded)
+
+	if err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if logs.Len() != 1 || logs.All()[0].Message != "failed to add comment" {
+		t.Fatalf("unexpected warnings: %+v", logs.All())
 	}
 }
 
