@@ -361,8 +361,8 @@ func TestRunReview(t *testing.T) {
 			NewPath: "main.go",
 			Content: "@@ -1 +1 @@\n-old\n+new",
 		}}, nil).Once()
-		aiProvider.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues":[{"file":"main.go","severity":"high","message":"fix this","line":3}]}`, nil).Once()
-		mrProvider.EXPECT().AddMergeRequestDiscussion(mock.Anything, "main.go", 3, "prefix:**HIGH**: fix this").Return(nil).Once()
+		aiProvider.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues":[{"file":"main.go","severity":"warning","message":"fix this","line":3}]}`, nil).Once()
+		mrProvider.EXPECT().AddMergeRequestDiscussion(mock.Anything, "main.go", 3, "prefix:**WARNING**: fix this").Return(nil).Once()
 
 		reviewer := newReviewer(cfg, mrProvider, aiProvider, logger)
 

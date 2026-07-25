@@ -10,6 +10,7 @@ import (
 	"github.com/adlandh/ai-mr-reviewer/internal/domain/mocks"
 	"github.com/stretchr/testify/mock"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type addedDiscussion struct {
@@ -191,15 +192,146 @@ func TestRunSkipsUnknownFilesFromAIResponse(t *testing.T) {
 
 }
 
-func TestBuildCombinedDiffSortsPathsAndDetectsLanguages(t *testing.T) {
-	got := buildCombinedDiff([]domain.Diff{
-		{NewPath: "b.unknown", Content: "diff-b"},
-		{NewPath: "a.go", Content: "diff-a"},
-	})
+func TestRunValidatesIssuesIndependently(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	core, logs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+	added := make([]addedDiscussion, 0, 1)
 
-	want := "File: a.go\nLanguage: Go\nDiff:\ndiff-a\n\nFile: b.unknown\nLanguage: Unknown\nDiff:\ndiff-b"
-	if got != want {
-		t.Fatalf("unexpected combined diff:\n%s", got)
+	h.mr.EXPECT().GetExistingComments(mock.Anything).Return(map[string][]string{}, nil)
+	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{{NewPath: "new.go", Content: "diff"}}, nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues":[
+		{"line":10,"severity":" WARNING ","message":" fix it "},
+		{"file":"new.go","line":0,"severity":"warning","message":"bad line"},
+		{"file":"new.go","line":11,"severity":"critical","message":"bad severity"},
+		{"file":"new.go","line":12,"severity":"info","message":"   "},
+		{"file":"other.go","line":13,"severity":"error","message":"bad file"}
+	]}`, nil)
+	h.mr.EXPECT().AddMergeRequestDiscussion(mock.Anything, "new.go", 10, warningComment).
+		Run(func(_ context.Context, file string, line int, body string) {
+			added = append(added, addedDiscussion{file: file, line: line, body: body})
+		}).
+		Return(nil)
+
+	if err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(added) != 1 {
+		t.Fatalf(expectedOneDiscussionFmt, len(added))
+	}
+	if logs.Len() != 4 {
+		t.Fatalf("expected 4 warnings, got %d", logs.Len())
+	}
+	for _, entry := range logs.All() {
+		if entry.Message != "skip invalid issue" {
+			t.Fatalf("unexpected warning: %s", entry.Message)
+		}
+	}
+}
+
+func TestRunSkipsMissingPathForMultipleFiles(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	core, logs := observer.New(zap.WarnLevel)
+	h.logger = zap.New(core)
+
+	h.mr.EXPECT().GetExistingComments(mock.Anything).Return(map[string][]string{}, nil)
+	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{
+		{NewPath: "a.go", Content: "diff-a"},
+		{NewPath: "b.go", Content: "diff-b"},
+	}, nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, mock.Anything).Return(`{"issues":[{"line":10,"severity":"warning","message":"fix it"}]}`, nil)
+
+	if err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if logs.Len() != 1 || logs.All()[0].ContextMap()["reason"] != "unknown file" {
+		t.Fatalf("unexpected warnings: %+v", logs.All())
+	}
+}
+
+func TestBuildReviewBatchesSortsPathsAndDetectsLanguages(t *testing.T) {
+	batches := buildReviewBatches([]domain.Diff{
+		{NewPath: "b.unknown", Content: "diff-b-1"},
+		{NewPath: "a.go", Content: "diff-a"},
+		{NewPath: "b.unknown", Content: "diff-b-2"},
+	}, 100000)
+	if len(batches) != 1 {
+		t.Fatalf("expected 1 batch, got %d", len(batches))
+	}
+
+	want := "File: a.go\nLanguage: Go\nDiff:\ndiff-a\n\n" +
+		"File: b.unknown\nLanguage: Unknown\nDiff:\ndiff-b-1\n\n" +
+		"File: b.unknown\nLanguage: Unknown\nDiff:\ndiff-b-2"
+	if batches[0].content != want {
+		t.Fatalf("unexpected combined diff:\n%s", batches[0].content)
+	}
+}
+
+func TestBuildReviewBatchesSplitsWholeSections(t *testing.T) {
+	diffs := []domain.Diff{
+		{NewPath: "c.go", Content: "diff-c"},
+		{NewPath: "a.go", Content: "diff-a"},
+		{NewPath: "b.go", Content: "diff-b"},
+	}
+	wantFirst := renderDiffSection(diffs[1]) + "\n\n" + renderDiffSection(diffs[2])
+
+	batches := buildReviewBatches(diffs, len(wantFirst))
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
+	if batches[0].content != wantFirst || batches[1].content != renderDiffSection(diffs[0]) {
+		t.Fatalf("unexpected batches: %+v", batches)
+	}
+}
+
+func TestBuildReviewBatchesKeepsOversizedSectionsWhole(t *testing.T) {
+	diffs := []domain.Diff{
+		{NewPath: "a.go", Content: "diff-a"},
+		{NewPath: "b.go", Content: "diff-b"},
+	}
+
+	batches := buildReviewBatches(diffs, 1)
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
+	for i, batch := range batches {
+		if batch.content != renderDiffSection(diffs[i]) {
+			t.Fatalf("batch %d was truncated: %q", i, batch.content)
+		}
+	}
+}
+
+func TestRunReviewsAllBatches(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	h.runtime.MaxDiffBytes = 1
+	h.mr.EXPECT().GetExistingComments(mock.Anything).Return(map[string][]string{}, nil)
+	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{
+		{NewPath: "b.go", Content: "diff-b"},
+		{NewPath: "a.go", Content: "diff-a"},
+	}, nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, renderDiffSection(domain.Diff{NewPath: "a.go", Content: "diff-a"})).Return(issueResponse(""), nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, renderDiffSection(domain.Diff{NewPath: "b.go", Content: "diff-b"})).Return(issueResponse(""), nil)
+
+	if err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunStopsWhenBatchReviewFails(t *testing.T) {
+	h := newReviewerHarness(t, false)
+	h.runtime.MaxDiffBytes = 1
+	h.mr.EXPECT().GetExistingComments(mock.Anything).Return(map[string][]string{}, nil)
+	h.mr.EXPECT().GetMergeRequestChanges(mock.Anything).Return([]domain.Diff{
+		{NewPath: "a.go", Content: "diff-a"},
+		{NewPath: "b.go", Content: "diff-b"},
+		{NewPath: "c.go", Content: "diff-c"},
+	}, nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, renderDiffSection(domain.Diff{NewPath: "a.go", Content: "diff-a"})).Return(issueResponse(""), nil)
+	h.ai.EXPECT().ReviewCode(mock.Anything, renderDiffSection(domain.Diff{NewPath: "b.go", Content: "diff-b"})).Return("", context.DeadlineExceeded)
+
+	err := NewReviewer(h.runtime, h.mr, h.ai, h.logger).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "review batch 2/3") {
+		t.Fatalf("expected second batch error, got %v", err)
 	}
 }
 

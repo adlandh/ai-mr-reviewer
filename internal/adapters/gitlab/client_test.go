@@ -58,10 +58,23 @@ func TestClientGetMergeRequestChangesReturnsDiffs(t *testing.T) {
 			t.Fatalf(errUnexpectedRequest, r.Method, r.URL.Path)
 		}
 
-		return httpstub.JSONResponse(http.StatusOK, fmt.Sprintf(`[
-			{"old_path":"old.go","new_path":"%s","diff":"@@ -1 +1 @@"},
-			{"old_path":"same.go","new_path":"same.go","diff":"@@ -2 +2 @@"}
-		]`, testNewGoPath)), nil
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Fatalf("unexpected per_page: %s", r.URL.Query().Get("per_page"))
+		}
+
+		switch r.URL.Query().Get("page") {
+		case "":
+			return gitLabJSONPage(fmt.Sprintf(`[
+				{"old_path":"old.go","new_path":"%s","diff":"@@ -1 +1 @@"}
+			]`, testNewGoPath), "2"), nil
+		case "2":
+			return gitLabJSONPage(`[
+				{"old_path":"same.go","new_path":"same.go","diff":"@@ -2 +2 @@"}
+			]`, ""), nil
+		default:
+			t.Fatalf("unexpected page: %s", r.URL.Query().Get("page"))
+			return nil, nil
+		}
 	}))
 	if err != nil {
 		t.Fatalf(errCreateStubGitLabClient, err)
@@ -124,11 +137,21 @@ func TestClientGetExistingCommentsReturnsOnlyNonSystemPositionedNotes(t *testing
 			t.Fatalf(errUnexpectedRequest, r.Method, r.URL.Path)
 		}
 
-		return httpstub.JSONResponse(http.StatusOK, `[
-			{"body":"first","system":false,"position":{"new_path":"foo.go","new_line":42}},
-			{"body":"system","system":true,"position":{"new_path":"foo.go","new_line":42}},
-			{"body":"missing-position","system":false}
-		]`), nil
+		switch r.URL.Query().Get("page") {
+		case "":
+			return gitLabJSONPage(`[
+				{"body":"first","system":false,"position":{"new_path":"foo.go","new_line":42}},
+				{"body":"system","system":true,"position":{"new_path":"foo.go","new_line":42}},
+				{"body":"missing-position","system":false}
+			]`, "2"), nil
+		case "2":
+			return gitLabJSONPage(`[
+				{"body":"second","system":false,"position":{"new_path":"foo.go","new_line":42}}
+			]`, ""), nil
+		default:
+			t.Fatalf("unexpected page: %s", r.URL.Query().Get("page"))
+			return nil, nil
+		}
 	}))
 	if err != nil {
 		t.Fatalf(errCreateStubGitLabClient, err)
@@ -138,7 +161,7 @@ func TestClientGetExistingCommentsReturnsOnlyNonSystemPositionedNotes(t *testing
 	if err != nil {
 		t.Fatalf("GetExistingComments returned error: %v", err)
 	}
-	if len(got) != 1 || len(got["foo.go:42"]) != 1 || got["foo.go:42"][0] != "first" {
+	if len(got) != 1 || len(got["foo.go:42"]) != 2 || got["foo.go:42"][0] != "first" || got["foo.go:42"][1] != "second" {
 		t.Fatalf("unexpected comments map: %#v", got)
 	}
 }
@@ -157,13 +180,16 @@ func TestClientDeleteBotCommentsExceptResolvedDeletesOnlyUnresolvedBotNotes(t *t
 		gogitlab.WithHTTPClient(&http.Client{
 			Transport: httpstub.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
 				switch {
-				case r.Method == http.MethodGet && r.URL.Path == testGitLabMRPath+testGitLabNotesPath:
-					return httpstub.JSONResponse(http.StatusOK, `[
-							{"id":1,"body":"ai-mr-reviewer: first","resolved":false,"system":false},
+				case r.Method == http.MethodGet && r.URL.Path == testGitLabMRPath+testGitLabNotesPath && r.URL.Query().Get("page") == "":
+					return gitLabJSONPage(`[
 							{"id":2,"body":"ai-mr-reviewer: resolved","resolved":true,"system":false},
 							{"id":3,"body":"system note","resolved":false,"system":true},
 							{"id":4,"body":"human note","resolved":false,"system":false}
-						]`), nil
+						]`, "2"), nil
+				case r.Method == http.MethodGet && r.URL.Path == testGitLabMRPath+testGitLabNotesPath && r.URL.Query().Get("page") == "2":
+					return gitLabJSONPage(`[
+							{"id":1,"body":"ai-mr-reviewer: first","resolved":false,"system":false}
+						]`, ""), nil
 				case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, testGitLabNotesPathPrefix):
 					deleted = append(deleted, strings.TrimPrefix(r.URL.Path, testGitLabNotesPathPrefix))
 					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
@@ -217,6 +243,29 @@ func TestClientDeleteBotCommentsExceptResolvedReturnsDeleteError(t *testing.T) {
 	}
 }
 
+func TestClientGetMergeRequestChangesReturnsLaterPageError(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(domain.GitLabConfig{URL: testGitLabBaseURL, Token: "token", ProjectID: "123"}, domain.RuntimeConfig{}, 5)
+	if err != nil {
+		t.Fatalf(errNewClient, err)
+	}
+	client.git, err = newStubGitLabClient(t, httpstub.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("page") == "2" {
+			return nil, errors.New("later page failed")
+		}
+
+		return gitLabJSONPage(`[]`, "2"), nil
+	}))
+	if err != nil {
+		t.Fatalf(errCreateStubGitLabClient, err)
+	}
+
+	if _, err := client.GetMergeRequestChanges(context.Background()); err == nil {
+		t.Fatal("expected later page error")
+	}
+}
+
 func newStubGitLabClient(t *testing.T, transport httpstub.RoundTripFunc) (*gogitlab.Client, error) {
 	t.Helper()
 
@@ -247,4 +296,13 @@ func assertDiscussionRequest(t *testing.T, got discussionRequest) {
 	if got.Position.OldPath != "foo.go" || got.Position.NewPath != "foo.go" {
 		t.Fatalf("unexpected paths: %+v", got.Position)
 	}
+}
+
+func gitLabJSONPage(body, nextPage string) *http.Response {
+	response := httpstub.JSONResponse(http.StatusOK, body)
+	if nextPage != "" {
+		response.Header.Set("X-Next-Page", nextPage)
+	}
+
+	return response
 }

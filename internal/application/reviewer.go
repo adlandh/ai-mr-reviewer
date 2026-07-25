@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/adlandh/ai-mr-reviewer/internal/domain"
@@ -31,6 +29,11 @@ type reviewIssuePayload struct {
 	Severity string `json:"severity"`
 	Message  string `json:"message"`
 	Line     int    `json:"line"`
+}
+
+type reviewBatch struct {
+	content string
+	diffs   []domain.Diff
 }
 
 var languageMap = map[string]string{
@@ -127,9 +130,18 @@ func hasExistingComments(path string, existing map[string][]string, prefix strin
 }
 
 func (r *Reviewer) reviewDiffs(ctx context.Context, diffs []domain.Diff) error {
-	combinedDiff := buildCombinedDiff(diffs)
+	batches := buildReviewBatches(diffs, r.runtime.MaxDiffBytes)
+	for i, batch := range batches {
+		if err := r.reviewBatch(ctx, batch); err != nil {
+			return fmt.Errorf("review batch %d/%d: %w", i+1, len(batches), err)
+		}
+	}
 
-	reviewText, err := r.aiProvider.ReviewCode(ctx, combinedDiff)
+	return nil
+}
+
+func (r *Reviewer) reviewBatch(ctx context.Context, batch reviewBatch) error {
+	reviewText, err := r.aiProvider.ReviewCode(ctx, batch.content)
 	if err != nil {
 		return fmt.Errorf("review code: %w", err)
 	}
@@ -139,33 +151,56 @@ func (r *Reviewer) reviewDiffs(ctx context.Context, diffs []domain.Diff) error {
 		return fmt.Errorf("parse review response: %w", err)
 	}
 
-	knownFiles := make(map[string]struct{}, len(diffs))
-	for _, d := range diffs {
+	knownFiles := make(map[string]struct{}, len(batch.diffs))
+	for _, d := range batch.diffs {
 		knownFiles[d.NewPath] = struct{}{}
 	}
 
 	prefix := r.runtime.CommentPrefix
 
 	for _, issue := range issues {
-		filePath := issue.FilePath
-		if filePath == "" && len(knownFiles) == 1 {
-			for onlyPath := range knownFiles {
-				filePath = onlyPath
-			}
-		}
-
-		if _, ok := knownFiles[filePath]; !ok {
-			r.logger.Warn("skip issue for unknown file", zap.String("file", issue.FilePath), zap.Int("line", issue.Line))
+		validated, reason := validateReviewIssue(issue, knownFiles)
+		if reason != "" {
+			r.logger.Warn("skip invalid issue", zap.String("reason", reason), zap.String("file", issue.FilePath), zap.Int("line", issue.Line))
 			continue
 		}
 
-		body := fmt.Sprintf("%s:**%s**: %s", prefix, strings.ToUpper(issue.Severity), issue.Message)
-		if err := r.mrProvider.AddMergeRequestDiscussion(ctx, filePath, issue.Line, body); err != nil {
-			r.logger.Warn("failed to add comment", zap.String("path", filePath), zap.Int("line", issue.Line), zap.Error(err))
+		body := fmt.Sprintf("%s:**%s**: %s", prefix, strings.ToUpper(validated.Severity), validated.Message)
+		if err := r.mrProvider.AddMergeRequestDiscussion(ctx, validated.FilePath, validated.Line, body); err != nil {
+			r.logger.Warn("failed to add comment", zap.String("path", validated.FilePath), zap.Int("line", validated.Line), zap.Error(err))
 		}
 	}
 
 	return nil
+}
+
+func validateReviewIssue(issue domain.ReviewIssue, knownFiles map[string]struct{}) (domain.ReviewIssue, string) {
+	if issue.FilePath == "" && len(knownFiles) == 1 {
+		for issue.FilePath = range knownFiles {
+		}
+	}
+
+	if _, ok := knownFiles[issue.FilePath]; !ok {
+		return issue, "unknown file"
+	}
+
+	if issue.Line <= 0 {
+		return issue, "line must be positive"
+	}
+
+	issue.Severity = strings.ToLower(strings.TrimSpace(issue.Severity))
+	switch issue.Severity {
+	case "error", "warning", "info":
+	default:
+		return issue, "unsupported severity"
+	}
+
+	issue.Message = strings.TrimSpace(issue.Message)
+	if issue.Message == "" {
+		return issue, "message must not be blank"
+	}
+
+	return issue, ""
 }
 
 func parseReviewResponse(response string) ([]domain.ReviewIssue, error) {
@@ -199,34 +234,52 @@ func parseReviewResponse(response string) ([]domain.ReviewIssue, error) {
 	return issues, nil
 }
 
-func buildCombinedDiff(diffs []domain.Diff) string {
-	uniquePaths := make(map[string]struct{}, len(diffs))
-	for _, d := range diffs {
-		uniquePaths[d.NewPath] = struct{}{}
-	}
+func buildReviewBatches(diffs []domain.Diff, maxBytes int) []reviewBatch {
+	sortedDiffs := slices.Clone(diffs)
+	slices.SortStableFunc(sortedDiffs, func(a, b domain.Diff) int {
+		return strings.Compare(a.NewPath, b.NewPath)
+	})
 
-	paths := slices.Collect(maps.Keys(uniquePaths))
-	sort.Strings(paths)
+	var (
+		batches    []reviewBatch
+		batchDiffs []domain.Diff
+		sections   []string
+	)
 
-	var builder strings.Builder
+	batchBytes := 0
 
-	for _, path := range paths {
-		for _, d := range diffs {
-			if d.NewPath != path {
-				continue
-			}
+	for _, d := range sortedDiffs {
+		section := renderDiffSection(d)
 
-			builder.WriteString("File: ")
-			builder.WriteString(d.NewPath)
-			builder.WriteString("\nLanguage: ")
-			builder.WriteString(detectLanguage(d.NewPath))
-			builder.WriteString("\nDiff:\n")
-			builder.WriteString(d.Content)
-			builder.WriteString("\n\n")
+		sectionBytes := len(section)
+		if len(sections) > 0 {
+			sectionBytes += 2
 		}
+
+		if maxBytes > 0 && len(sections) > 0 && batchBytes+sectionBytes > maxBytes {
+			batches = append(batches, reviewBatch{diffs: slices.Clone(batchDiffs), content: strings.Join(sections, "\n\n")})
+			batchDiffs = batchDiffs[:0]
+			sections = sections[:0]
+			batchBytes = 0
+			sectionBytes = len(section)
+		}
+
+		batchDiffs = append(batchDiffs, d)
+		sections = append(sections, section)
+		batchBytes += sectionBytes
 	}
 
-	return strings.TrimSpace(builder.String())
+	if len(sections) > 0 {
+		batches = append(batches, reviewBatch{diffs: slices.Clone(batchDiffs), content: strings.Join(sections, "\n\n")})
+	}
+
+	return batches
+}
+
+func renderDiffSection(d domain.Diff) string {
+	return "File: " + d.NewPath +
+		"\nLanguage: " + detectLanguage(d.NewPath) +
+		"\nDiff:\n" + d.Content
 }
 
 func extractJSON(s string) string {

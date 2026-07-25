@@ -35,6 +35,7 @@ type envConfig struct {
 	CommentPrefix           string        `env:"COMMENT_PREFIX,notEmpty" envDefault:"ai-mr-reviewer"`
 	RunTimeout              time.Duration `env:"RUN_TIMEOUT" envDefault:"10m"`
 	DeleteBotComments       bool          `env:"DELETE_BOT_COMMENTS" envDefault:"true"`
+	MaxDiffBytes            int           `env:"MAX_DIFF_BYTES" envDefault:"100000"`
 }
 
 func New() (*domain.Config, error) {
@@ -43,11 +44,16 @@ func New() (*domain.Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	if raw.MaxDiffBytes <= 0 {
+		return nil, fmt.Errorf("MAX_DIFF_BYTES must be positive")
+	}
+
 	return &domain.Config{
 		Runtime: domain.RuntimeConfig{
 			CommentPrefix:     raw.CommentPrefix,
 			RunTimeout:        raw.RunTimeout,
 			DeleteBotComments: raw.DeleteBotComments,
+			MaxDiffBytes:      raw.MaxDiffBytes,
 		},
 		VCS: domain.VCSConfig{
 			Provider: raw.VCSProvider,

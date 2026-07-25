@@ -71,10 +71,12 @@ go run ./main.go
 
 ## How Reviews Work
 
-- The reviewer sends one combined diff per run, not one request per file.
+- The reviewer fetches every API page of changed files and existing comments.
+- Diff sections are sorted by path and grouped into sequential AI requests near `MAX_DIFF_BYTES`.
+- A single section larger than `MAX_DIFF_BYTES` is sent whole in its own request rather than truncated.
 - Existing comments are checked so already-reviewed files can be skipped.
 - The AI response is expected to contain JSON with an `issues` array.
-- Each issue becomes an inline discussion if the target platform accepts the location.
+- Valid issues become inline discussions; malformed issues are logged and skipped independently.
 - `RUN_TIMEOUT` limits the full run, including API calls and model inference.
 
 ## Configuration
@@ -90,6 +92,7 @@ The application is configured entirely through environment variables.
 | `COMMENT_PREFIX` | Prefix added to every bot comment as `<prefix>:` | `ai-mr-reviewer` |
 | `DELETE_BOT_COMMENTS` | Delete previous unresolved bot comments before reviewing | `true` |
 | `RUN_TIMEOUT` | Maximum duration for a full review run | `10m` |
+| `MAX_DIFF_BYTES` | Target maximum rendered diff bytes per AI request | `100000` |
 
 ### GitLab Settings
 
@@ -396,7 +399,8 @@ Important files:
 
 ## Notes and Limitations
 
-- Reviews are sent as one combined diff, so very large PRs or MRs can hit model context limits.
+- Byte-targeted batching reduces context pressure, but one oversized file can still exceed a model's context window because file diffs are never truncated.
+- GitHub files without a textual patch, such as binary files, are skipped while other files remain reviewable.
 - On GitHub, inline comments can fall back depending on review API line-placement rules.
 - The tool expects the AI response to be parseable into the expected JSON issue format.
 - Unsupported VCS providers or AI providers fail early at startup.

@@ -12,6 +12,7 @@ type RuntimeConfig struct {
 	CommentPrefix     string
 	RunTimeout        time.Duration
 	DeleteBotComments bool
+	MaxDiffBytes      int
 }
 
 type VCSConfig struct {
