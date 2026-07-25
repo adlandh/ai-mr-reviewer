@@ -167,6 +167,8 @@ func TestClientGetExistingCommentsReturnsOnlyNonSystemPositionedNotes(t *testing
 }
 
 func TestClientReturnsListNotesError(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		call func(*Client) error
