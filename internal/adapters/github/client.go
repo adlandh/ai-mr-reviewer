@@ -21,6 +21,8 @@ type Client struct {
 	prNumber      int
 }
 
+const listPageSize = 100
+
 func NewClient(token, owner, repo, prNumber, commitSHA, commentPrefix string) (*Client, error) {
 	httpClient := &http.Client{}
 	client := github.NewClient(httpClient)
@@ -42,23 +44,39 @@ func NewClient(token, owner, repo, prNumber, commitSHA, commentPrefix string) (*
 }
 
 func (c *Client) GetMergeRequestChanges(ctx context.Context) ([]domain.Diff, error) {
-	files, _, err := c.client.PullRequests.ListFiles(ctx, c.owner, c.repo, c.prNumber, &github.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get PR files: %w", err)
+	options := &github.ListOptions{PerPage: listPageSize}
+
+	var files []*github.CommitFile
+
+	for {
+		page, response, err := c.client.PullRequests.ListFiles(ctx, c.owner, c.repo, c.prNumber, options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get PR files: %w", err)
+		}
+
+		files = append(files, page...)
+
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+
+		options.Page = response.NextPage
 	}
 
 	var diffs []domain.Diff
 
 	for _, f := range files {
-		prevFilename := ""
-		if f.PreviousFilename != nil {
-			prevFilename = *f.PreviousFilename
+		filename := f.GetFilename()
+
+		patch := f.GetPatch()
+		if filename == "" || patch == "" {
+			continue
 		}
 
 		diffs = append(diffs, domain.Diff{
-			NewPath: *f.Filename,
-			OldPath: prevFilename,
-			Content: *f.Patch,
+			NewPath: filename,
+			OldPath: f.GetPreviousFilename(),
+			Content: patch,
 		})
 	}
 
@@ -68,15 +86,15 @@ func (c *Client) GetMergeRequestChanges(ctx context.Context) ([]domain.Diff, err
 func (c *Client) GetExistingComments(ctx context.Context) (map[string][]string, error) {
 	existing := make(map[string][]string)
 
-	reviewComments, _, err := c.client.PullRequests.ListComments(ctx, c.owner, c.repo, c.prNumber, &github.PullRequestListCommentsOptions{})
+	reviewComments, err := c.listReviewComments(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list PR review comments: %w", err)
+		return nil, err
 	}
 
 	for _, comment := range reviewComments {
 		if comment.Path != nil && comment.Line != nil {
-			key := fmt.Sprintf("%s:%d", *comment.Path, *comment.Line)
-			existing[key] = append(existing[key], *comment.Body)
+			key := fmt.Sprintf("%s:%d", comment.GetPath(), comment.GetLine())
+			existing[key] = append(existing[key], comment.GetBody())
 		}
 	}
 
@@ -118,9 +136,9 @@ func (c *Client) DeleteBotCommentsExceptResolved(ctx context.Context) error {
 }
 
 func (c *Client) deleteBotReviewComments(ctx context.Context) error {
-	reviewComments, _, err := c.client.PullRequests.ListComments(ctx, c.owner, c.repo, c.prNumber, &github.PullRequestListCommentsOptions{})
+	reviewComments, err := c.listReviewComments(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list PR review comments: %w", err)
+		return err
 	}
 
 	for _, comment := range reviewComments {
@@ -142,9 +160,9 @@ func (c *Client) deleteBotReviewComments(ctx context.Context) error {
 }
 
 func (c *Client) deleteBotIssueComments(ctx context.Context) error {
-	issueComments, _, err := c.client.Issues.ListComments(ctx, c.owner, c.repo, c.prNumber, &github.IssueListCommentsOptions{})
+	issueComments, err := c.listIssueComments(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list PR issue comments: %w", err)
+		return err
 	}
 
 	for _, comment := range issueComments {
@@ -163,6 +181,48 @@ func (c *Client) deleteBotIssueComments(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *Client) listReviewComments(ctx context.Context) ([]*github.PullRequestComment, error) {
+	options := &github.PullRequestListCommentsOptions{ListOptions: github.ListOptions{PerPage: listPageSize}}
+
+	var comments []*github.PullRequestComment
+
+	for {
+		page, response, err := c.client.PullRequests.ListComments(ctx, c.owner, c.repo, c.prNumber, options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list PR review comments: %w", err)
+		}
+
+		comments = append(comments, page...)
+
+		if response == nil || response.NextPage == 0 {
+			return comments, nil
+		}
+
+		options.Page = response.NextPage
+	}
+}
+
+func (c *Client) listIssueComments(ctx context.Context) ([]*github.IssueComment, error) {
+	options := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: listPageSize}}
+
+	var comments []*github.IssueComment
+
+	for {
+		page, response, err := c.client.Issues.ListComments(ctx, c.owner, c.repo, c.prNumber, options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list PR issue comments: %w", err)
+		}
+
+		comments = append(comments, page...)
+
+		if response == nil || response.NextPage == 0 {
+			return comments, nil
+		}
+
+		options.Page = response.NextPage
+	}
 }
 
 var _ domain.MRProviderPort = (*Client)(nil)

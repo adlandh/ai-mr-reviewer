@@ -45,6 +45,33 @@ func TestNewConfigWithDefaults(t *testing.T) {
 	if cfg.Runtime.RunTimeout != 10*time.Minute {
 		t.Fatalf("unexpected RunTimeout: %s", cfg.Runtime.RunTimeout)
 	}
+	if cfg.Runtime.MaxDiffBytes != 100000 {
+		t.Fatalf("unexpected MaxDiffBytes: %d", cfg.Runtime.MaxDiffBytes)
+	}
+}
+
+func TestNewConfigMaxDiffBytesOverride(t *testing.T) {
+	t.Setenv("MAX_DIFF_BYTES", "2048")
+
+	cfg, err := New()
+	if err != nil {
+		t.Fatalf("expected config, got error: %v", err)
+	}
+	if cfg.Runtime.MaxDiffBytes != 2048 {
+		t.Fatalf("unexpected MaxDiffBytes: %d", cfg.Runtime.MaxDiffBytes)
+	}
+}
+
+func TestNewConfigRejectsInvalidMaxDiffBytes(t *testing.T) {
+	for _, value := range []string{"0", "-1", "invalid"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_DIFF_BYTES", value)
+
+			if _, err := New(); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
 }
 
 func TestNewConfigMissingRequired(t *testing.T) {

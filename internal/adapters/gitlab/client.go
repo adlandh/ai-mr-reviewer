@@ -17,6 +17,8 @@ type Client struct {
 	iid     int
 }
 
+const listPageSize = 100
+
 func NewClient(config domain.GitLabConfig, runtime domain.RuntimeConfig, iid int) (*Client, error) {
 	git, err := gitlab.NewClient(config.Token, gitlab.WithBaseURL(config.URL))
 	if err != nil {
@@ -32,14 +34,28 @@ func NewClient(config domain.GitLabConfig, runtime domain.RuntimeConfig, iid int
 }
 
 func (c *Client) GetMergeRequestChanges(ctx context.Context) ([]domain.Diff, error) {
-	changes, _, err := c.git.MergeRequests.ListMergeRequestDiffs(
-		c.gitlab.ProjectID,
-		int64(c.iid),
-		&gitlab.ListMergeRequestDiffsOptions{},
-		gitlab.WithContext(ctx),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get MR changes: %w", err)
+	options := &gitlab.ListMergeRequestDiffsOptions{ListOptions: gitlab.ListOptions{PerPage: listPageSize}}
+
+	var changes []*gitlab.MergeRequestDiff
+
+	for {
+		page, response, err := c.git.MergeRequests.ListMergeRequestDiffs(
+			c.gitlab.ProjectID,
+			int64(c.iid),
+			options,
+			gitlab.WithContext(ctx),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get MR changes: %w", err)
+		}
+
+		changes = append(changes, page...)
+
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+
+		options.Page = response.NextPage
 	}
 
 	var diffs []domain.Diff
@@ -55,14 +71,9 @@ func (c *Client) GetMergeRequestChanges(ctx context.Context) ([]domain.Diff, err
 }
 
 func (c *Client) GetExistingComments(ctx context.Context) (map[string][]string, error) {
-	notes, _, err := c.git.Notes.ListMergeRequestNotes(
-		c.gitlab.ProjectID,
-		int64(c.iid),
-		&gitlab.ListMergeRequestNotesOptions{},
-		gitlab.WithContext(ctx),
-	)
+	notes, err := c.listMergeRequestNotes(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list notes: %w", err)
+		return nil, err
 	}
 
 	existing := make(map[string][]string)
@@ -117,14 +128,9 @@ func (c *Client) AddMergeRequestDiscussion(ctx context.Context, file string, lin
 }
 
 func (c *Client) DeleteBotCommentsExceptResolved(ctx context.Context) error {
-	notes, _, err := c.git.Notes.ListMergeRequestNotes(
-		c.gitlab.ProjectID,
-		int64(c.iid),
-		&gitlab.ListMergeRequestNotesOptions{},
-		gitlab.WithContext(ctx),
-	)
+	notes, err := c.listMergeRequestNotes(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list notes: %w", err)
+		return err
 	}
 
 	for _, note := range notes {
@@ -143,6 +149,32 @@ func (c *Client) DeleteBotCommentsExceptResolved(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (c *Client) listMergeRequestNotes(ctx context.Context) ([]*gitlab.Note, error) {
+	options := &gitlab.ListMergeRequestNotesOptions{ListOptions: gitlab.ListOptions{PerPage: listPageSize}}
+
+	var notes []*gitlab.Note
+
+	for {
+		page, response, err := c.git.Notes.ListMergeRequestNotes(
+			c.gitlab.ProjectID,
+			int64(c.iid),
+			options,
+			gitlab.WithContext(ctx),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list notes: %w", err)
+		}
+
+		notes = append(notes, page...)
+
+		if response == nil || response.NextPage == 0 {
+			return notes, nil
+		}
+
+		options.Page = response.NextPage
+	}
 }
 
 var _ domain.MRProviderPort = (*Client)(nil)
