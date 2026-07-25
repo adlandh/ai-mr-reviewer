@@ -166,24 +166,47 @@ func TestClientGetExistingCommentsReturnsOnlyNonSystemPositionedNotes(t *testing
 	}
 }
 
-func TestClientGetExistingCommentsReturnsListError(t *testing.T) {
-	t.Parallel()
+func TestClientReturnsListNotesError(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Client) error
+	}{
+		{
+			name: "get existing comments",
+			call: func(client *Client) error {
+				_, err := client.GetExistingComments(context.Background())
 
-	wantErr := errors.New("list notes failed")
-	client, err := NewClient(domain.GitLabConfig{URL: testGitLabBaseURL, Token: "token", ProjectID: "123"}, domain.RuntimeConfig{}, 5)
-	if err != nil {
-		t.Fatalf(errNewClient, err)
-	}
-	client.git, err = newStubGitLabClient(t, httpstub.RoundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, wantErr
-	}))
-	if err != nil {
-		t.Fatalf(errCreateStubGitLabClient, err)
+				return err
+			},
+		},
+		{
+			name: "delete bot comments",
+			call: func(client *Client) error {
+				return client.DeleteBotCommentsExceptResolved(context.Background())
+			},
+		},
 	}
 
-	_, err = client.GetExistingComments(context.Background())
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected %v, got %v", wantErr, err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			wantErr := errors.New("list notes failed")
+			client, err := NewClient(domain.GitLabConfig{URL: testGitLabBaseURL, Token: "token", ProjectID: "123"}, domain.RuntimeConfig{}, 5)
+			if err != nil {
+				t.Fatalf(errNewClient, err)
+			}
+			client.git, err = newStubGitLabClient(t, httpstub.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, wantErr
+			}))
+			if err != nil {
+				t.Fatalf(errCreateStubGitLabClient, err)
+			}
+
+			if err := test.call(client); !errors.Is(err, wantErr) {
+				t.Fatalf("expected %v, got %v", wantErr, err)
+			}
+		})
 	}
 }
 
@@ -261,27 +284,6 @@ func TestClientDeleteBotCommentsExceptResolvedReturnsDeleteError(t *testing.T) {
 
 	if err := client.DeleteBotCommentsExceptResolved(context.Background()); err == nil {
 		t.Fatal("expected delete error")
-	}
-}
-
-func TestClientDeleteBotCommentsExceptResolvedReturnsListError(t *testing.T) {
-	t.Parallel()
-
-	wantErr := errors.New("list notes failed")
-	client, err := NewClient(domain.GitLabConfig{URL: testGitLabBaseURL, Token: "token", ProjectID: "123"}, domain.RuntimeConfig{}, 5)
-	if err != nil {
-		t.Fatalf(errNewClient, err)
-	}
-	client.git, err = newStubGitLabClient(t, httpstub.RoundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, wantErr
-	}))
-	if err != nil {
-		t.Fatalf(errCreateStubGitLabClient, err)
-	}
-
-	err = client.DeleteBotCommentsExceptResolved(context.Background())
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected %v, got %v", wantErr, err)
 	}
 }
 
